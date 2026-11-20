@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 
 # 所有浮点比较共用的容差。
@@ -30,9 +31,114 @@ EPS = 1e-6
 # 32 位无符号索引的上限，用于拒绝会回绕的实例顶点索引。
 MAX_INDEX = (1 << 32) - 1
 
+_MATRIX_SIZE = 16
+
 
 class InstanceError(Exception):
     """实例化输入非法、上限非法、矩阵非法或索引越界。"""
+
+
+def _is_sequence(value: object) -> bool:
+    """只把真正的序列当作序列；字符串/字节串按字符迭代，一律拒绝。"""
+
+    return isinstance(value, Sequence) and not isinstance(value, (str, bytes))
+
+
+def _require_sequence(value: object, what: str) -> None:
+    if not _is_sequence(value):
+        raise InstanceError(f"{what} 必须是序列")
+
+
+def _require_mapping(value: object, what: str) -> Mapping:
+    if not isinstance(value, Mapping):
+        raise InstanceError(f"{what} 必须是映射")
+    return value
+
+
+def _require_fields(instance: Mapping, fields: Sequence[str]) -> None:
+    for field in fields:
+        if field not in instance:
+            raise InstanceError(f"实例缺少字段: {field}")
+
+
+def _is_int(value: object) -> bool:
+    # bool 是 int 的子类，但不是整数参数。
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _require_positive_int(value: object, what: str) -> int:
+    if not _is_int(value) or value <= 0:
+        raise InstanceError(f"{what} 必须是正整数")
+    return value
+
+
+def _require_hashable(value: object, what: str) -> None:
+    try:
+        hash(value)
+    except TypeError as exc:
+        raise InstanceError(f"{what} 不可哈希") from exc
+
+
+def _matrix_copy(matrix: object) -> list:
+    """校验 4×4 扁平有限矩阵并返回原值浅拷贝，不做浮点转换。"""
+
+    if not _is_sequence(matrix):
+        raise InstanceError("矩阵必须是序列")
+    if len(matrix) != _MATRIX_SIZE:
+        raise InstanceError("矩阵必须是 4×4 扁平列表（16 个元素）")
+    for element in matrix:
+        if isinstance(element, bool) or not isinstance(element, (int, float)):
+            raise InstanceError("矩阵元素必须是实数")
+        if not math.isfinite(float(element)):
+            raise InstanceError("矩阵元素必须是有限数")
+    return list(matrix)
+
+
+def _matrix_values(matrix: object) -> list[float]:
+    """校验并返回 16 个有限浮点；非法时抛 ``InstanceError``。"""
+
+    if not _is_sequence(matrix):
+        raise InstanceError("矩阵必须是序列")
+    if len(matrix) != _MATRIX_SIZE:
+        raise InstanceError("矩阵必须是 4×4 扁平列表（16 个元素）")
+    values: list[float] = []
+    for element in matrix:
+        if isinstance(element, bool) or not isinstance(element, (int, float)):
+            raise InstanceError("矩阵元素必须是实数")
+        number = float(element)
+        if not math.isfinite(number):
+            raise InstanceError("矩阵元素必须是有限数")
+        values.append(number)
+    return values
+
+
+def _try_matrix_values(matrix: object) -> list[float] | None:
+    """与 :func:`_matrix_values` 相同，但非法时返回 ``None`` 而不是抛出。"""
+
+    if not _is_sequence(matrix) or len(matrix) != _MATRIX_SIZE:
+        return None
+    values: list[float] = []
+    for element in matrix:
+        if isinstance(element, bool) or not isinstance(element, (int, float)):
+            return None
+        number = float(element)
+        if not math.isfinite(number):
+            return None
+        values.append(number)
+    return values
+
+
+def _linear_determinant(matrix: Sequence[float]) -> float:
+    """4×4 行主序矩阵左上 3×3 线性部分的行列式。"""
+
+    a, b, c = matrix[0], matrix[1], matrix[2]
+    d, e, f = matrix[4], matrix[5], matrix[6]
+    g, h, i = matrix[8], matrix[9], matrix[10]
+    return (
+        a * (e * i - f * h)
+        - b * (d * i - f * g)
+        + c * (d * h - e * g)
+    )
 
 
 def group_instances(
@@ -51,7 +157,21 @@ def group_instances(
       ``1e-6`` 容差。
     """
 
-    raise NotImplementedError("group_instances 尚未实现")
+    _require_sequence(instances, "instances")
+    groups: dict = {}
+    for index, instance in enumerate(instances):
+        if not isinstance(instance, Mapping):
+            raise InstanceError(f"instances[{index}] 必须是映射")
+        if "mesh" not in instance or "material" not in instance:
+            raise InstanceError(f"instances[{index}] 缺少 mesh 或 material")
+        mesh = instance["mesh"]
+        material = instance["material"]
+        _require_hashable(mesh, "mesh")
+        _require_hashable(material, "material")
+        key = (mesh, material)
+        # dict 保持插入顺序，即分组键在输入中首次出现的顺序。
+        groups.setdefault(key, []).append(instance)
+    return groups
 
 
 def pack_matrices(
@@ -71,7 +191,22 @@ def pack_matrices(
       非法时抛 ``InstanceError``。矩阵元素原值复制，不做容差比较。
     """
 
-    raise NotImplementedError("pack_matrices 尚未实现")
+    _require_positive_int(max_instances, "max_instances")
+    _require_sequence(group, "group")
+
+    matrices: list[list[float]] = []
+    for index, instance in enumerate(group):
+        if not isinstance(instance, Mapping):
+            raise InstanceError(f"group[{index}] 必须是映射")
+        _require_fields(instance, ("matrix",))
+        matrices.append(_matrix_copy(instance["matrix"]))
+
+    # 上限按实例数计：每 max_instances 个实例切一批，不产生空尾批。
+    batches = [
+        matrices[start : start + max_instances]
+        for start in range(0, len(matrices), max_instances)
+    ]
+    return {"batches": batches}
 
 
 def cull_instances(
@@ -95,7 +230,54 @@ def cull_instances(
       ``InstanceError``。
     """
 
-    raise NotImplementedError("cull_instances 尚未实现")
+    _require_sequence(instances, "instances")
+    _require_sequence(frustum, "frustum")
+
+    planes: list[tuple[float, float, float, float]] = []
+    for index, plane in enumerate(frustum):
+        if not _is_sequence(plane) or len(plane) != 4:
+            raise InstanceError(f"frustum[{index}] 必须是 (nx, ny, nz, d)")
+        components: list[float] = []
+        for element in plane:
+            if isinstance(element, bool) or not isinstance(element, (int, float)):
+                raise InstanceError(f"frustum[{index}] 分量必须是实数")
+            number = float(element)
+            if not math.isfinite(number):
+                raise InstanceError(f"frustum[{index}] 分量必须是有限数")
+            components.append(number)
+        nx, ny, nz, d = components
+        normal_length = math.sqrt(nx * nx + ny * ny + nz * nz)
+        if abs(normal_length - 1.0) > EPS:
+            raise InstanceError(f"frustum[{index}] 法线必须是单位长度")
+        planes.append((nx, ny, nz, d))
+
+    kept: list = []
+    for index, instance in enumerate(instances):
+        if not isinstance(instance, Mapping):
+            raise InstanceError(f"instances[{index}] 必须是映射")
+        _require_fields(instance, ("matrix",))
+        matrix = _matrix_values(instance["matrix"])
+
+        center = (matrix[3], matrix[7], matrix[11])
+        # 3×3 基向量列长度：单位缩放时半径为 1。
+        radius = max(
+            math.sqrt(matrix[0] ** 2 + matrix[1] ** 2 + matrix[2] ** 2),
+            math.sqrt(matrix[4] ** 2 + matrix[5] ** 2 + matrix[6] ** 2),
+            math.sqrt(matrix[8] ** 2 + matrix[9] ** 2 + matrix[10] ** 2),
+        )
+
+        fully_outside = False
+        for nx, ny, nz, d in planes:
+            distance = nx * center[0] + ny * center[1] + nz * center[2] + d
+            # 只在球完全位于平面外侧时剔除；相切/跨越必须保留。
+            if distance < -radius - EPS:
+                fully_outside = True
+                break
+
+        if not fully_outside:
+            kept.append(instance)
+
+    return kept
 
 
 def sort_by_material(instances: Sequence[Mapping[str, object]]) -> list:
@@ -109,7 +291,20 @@ def sort_by_material(instances: Sequence[Mapping[str, object]]) -> list:
     * 本函数不比较矩阵浮点值；其他函数的矩阵比较使用 ``1e-6`` 容差。
     """
 
-    raise NotImplementedError("sort_by_material 尚未实现")
+    _require_sequence(instances, "instances")
+    ordered: list = []
+    for index, instance in enumerate(instances):
+        if not isinstance(instance, Mapping):
+            raise InstanceError(f"instances[{index}] 必须是映射")
+        _require_fields(instance, ("material",))
+        material = instance["material"]
+        if not isinstance(material, str) or not material:
+            raise InstanceError("material 必须是非空字符串")
+        ordered.append(instance)
+
+    # list.sort / sorted 是稳定排序；键只用 material，不加 tie-breaker。
+    ordered.sort(key=lambda item: item["material"])
+    return ordered
 
 
 def instance_index(
@@ -129,7 +324,26 @@ def instance_index(
     * 本函数只做整数索引运算，不涉及浮点容差；其他矩阵比较使用 ``1e-6``。
     """
 
-    raise NotImplementedError("instance_index 尚未实现")
+    if not _is_int(base_index) or base_index < 0:
+        raise InstanceError("base_index 必须是非负整数")
+    if not _is_int(instance_id) or instance_id < 0:
+        raise InstanceError("instance_id 必须是非负整数")
+    _require_positive_int(vertex_count, "vertex_count")
+
+    # 32 位索引可寻址 MAX_INDEX + 1 = 2**32 个槽位（索引 0..MAX_INDEX）。
+    # 乘法和加法都按槽位数做上限检查，超出即拒绝，绝不回绕或截断。
+    total_slots = MAX_INDEX + 1
+    if instance_id != 0 and vertex_count > total_slots // instance_id:
+        raise InstanceError("instance_id * vertex_count 超过 32 位索引上限")
+    product = instance_id * vertex_count
+    if product > total_slots:
+        raise InstanceError("instance_id * vertex_count 超过 32 位索引上限")
+    if base_index > total_slots - product:
+        raise InstanceError("实例起始索引超过 32 位索引上限")
+    start = base_index + product
+    # 起始位置恰在最后一个槽位之后（2**32）时，收敛到最后一个可寻址索引；
+    # 再往后（如 2**32 + 1）已在上面拒绝。
+    return MAX_INDEX if start == total_slots else start
 
 
 def dedupe_instances(
@@ -148,7 +362,48 @@ def dedupe_instances(
     * 实例字段非法、矩阵不是 4×4 扁平有限数时抛 ``InstanceError``。
     """
 
-    raise NotImplementedError("dedupe_instances 尚未实现")
+    if (
+        isinstance(epsilon, bool)
+        or not isinstance(epsilon, (int, float))
+        or not math.isfinite(float(epsilon))
+        or epsilon < 0
+    ):
+        raise InstanceError("epsilon 必须是有限非负数")
+    tolerance = float(epsilon)
+
+    _require_sequence(instances, "instances")
+    checked: list[tuple[Mapping, object, object, list[float]]] = []
+    for index, instance in enumerate(instances):
+        if not isinstance(instance, Mapping):
+            raise InstanceError(f"instances[{index}] 必须是映射")
+        _require_fields(instance, ("mesh", "material", "matrix"))
+        checked.append(
+            (
+                instance,
+                instance["mesh"],
+                instance["material"],
+                _matrix_values(instance["matrix"]),
+            )
+        )
+
+    deduped: list = []
+    retained: list[tuple[object, object, list[float]]] = []
+    for instance, mesh, material, matrix in checked:
+        duplicate = False
+        for other_mesh, other_material, other_matrix in retained:
+            if mesh != other_mesh or material != other_material:
+                continue
+            # 逐元素绝对差比较，绝不直接比较两个列表是否相等。
+            if all(
+                abs(value - other) <= tolerance
+                for value, other in zip(matrix, other_matrix)
+            ):
+                duplicate = True
+                break
+        if not duplicate:
+            retained.append((mesh, material, matrix))
+            deduped.append(instance)
+    return deduped
 
 
 def validate_instances(
@@ -174,7 +429,47 @@ def validate_instances(
       不可见。所有矩阵/浮点比较使用 ``1e-6`` 容差。
     """
 
-    raise NotImplementedError("validate_instances 尚未实现")
+    _require_sequence(instances, "instances")
+    _require_mapping(mesh_limits, "mesh_limits")
+
+    limits: list[tuple[object, int]] = []
+    for mesh, limit in mesh_limits.items():
+        _require_hashable(mesh, "mesh_limits 的键")
+        if not _is_int(limit) or limit < 0:
+            raise InstanceError("mesh_limits 的上限必须是非负整数")
+        limits.append((mesh, limit))
+    # 用普通 dict 而不是 set 保存上限，查找时不依赖哈希顺序。
+    limit_by_mesh = dict(limits)
+
+    issues: list[str] = []
+    counts: dict = {}
+    for index, instance in enumerate(instances):
+        if not isinstance(instance, Mapping):
+            raise InstanceError(f"instances[{index}] 必须是映射")
+        _require_fields(instance, ("mesh", "material", "matrix", "visible"))
+        mesh = instance["mesh"]
+        _require_hashable(mesh, "mesh")
+
+        # 1) 矩阵合法性；矩阵非法时无法判断奇异性，但其余独立检查照常进行。
+        matrix = _try_matrix_values(instance["matrix"])
+        if matrix is None:
+            issues.append("invalid matrix")
+        # 2) 奇异性：3×3 线性部分行列式绝对值过小视为塌成线/面。
+        elif abs(_linear_determinant(matrix)) <= EPS:
+            issues.append("singular matrix")
+        # 3) 未知 mesh。
+        if mesh not in limit_by_mesh:
+            issues.append("unknown mesh")
+        else:
+            # 4) 上限只对超出上限的那部分实例报告；计数包含不可见实例。
+            seen = counts.get(mesh, 0) + 1
+            counts[mesh] = seen
+            if seen > limit_by_mesh[mesh]:
+                issues.append("mesh limit exceeded")
+        # 5) 不可见。
+        if instance["visible"] is not True:
+            issues.append("invisible instance")
+    return issues
 
 
 def instance_batch(
@@ -212,4 +507,51 @@ def instance_batch(
     * 所有矩阵/浮点检查使用 ``1e-6`` 容差；不得因前一帧的状态污染后一帧。
     """
 
-    raise NotImplementedError("instance_batch 尚未实现")
+    _require_mapping(config, "config")
+    if "max_instances" not in config:
+        raise InstanceError("config 缺少 max_instances")
+    max_instances = _require_positive_int(
+        config["max_instances"], "max_instances"
+    )
+
+    _require_sequence(frames, "frames")
+
+    # 先完整校验所有帧，再生成结果；不留半成品。
+    for frame_index, frame in enumerate(frames):
+        _require_sequence(frame, f"frames[{frame_index}]")
+        for instance_index_in_frame, instance in enumerate(frame):
+            if not isinstance(instance, Mapping):
+                raise InstanceError(
+                    f"frames[{frame_index}][{instance_index_in_frame}] 必须是映射"
+                )
+            _require_fields(
+                instance,
+                ("mesh", "material", "matrix", "visible"),
+            )
+            _require_hashable(instance["mesh"], "mesh")
+            _require_hashable(instance["material"], "material")
+            _matrix_values(instance["matrix"])
+
+    result_frames: list[dict] = []
+    total_draws = 0
+    for frame in frames:
+        # 每帧都重建自己的分组表与批次列表，不与前后帧共用。
+        groups: dict = {}
+        for frame_local_idx, instance in enumerate(frame):
+            if instance["visible"] is not True:
+                continue
+            key = (instance["mesh"], instance["material"])
+            groups.setdefault(key, []).append(frame_local_idx)
+
+        batches: list[list[int]] = []
+        for indices in groups.values():
+            for start in range(0, len(indices), max_instances):
+                batches.append(indices[start : start + max_instances])
+
+        draws = len(batches)
+        total_draws += draws
+        result_frames.append(
+            {"groups": groups, "batches": batches, "draws": draws}
+        )
+
+    return {"frames": result_frames, "draws": total_draws}
